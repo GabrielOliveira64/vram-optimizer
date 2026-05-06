@@ -1,160 +1,316 @@
 /*
- * main.cpp
+ * main.cpp — v3
  * ─────────────────────────────────────────────────────────────────────────────
- * Ponto de entrada para testar o monitor + orquestrador juntos.
- * Simula texturas sendo carregadas como se viessem do hook DX11.
+ * Integra: Monitor + Orchestrator + IPCServer (hook) + IPCStatusServer (UI)
  *
- * Compilar com CMake:
- *   mkdir build && cd build
- *   cmake .. && cmake --build .
+ * Modos:
+ *   vram_optimizer.exe              → modo completo (hook + UI)
+ *   vram_optimizer.exe --standalone → sem hook, texturas simuladas
+ *
+ * Compilar direto (Developer Command Prompt VS 2022):
+ *   cl /std:c++17 /EHsc /O2 /W3 ^
+ *      src\main.cpp ^
+ *      monitor\VRAMMonitor.cpp ^
+ *      orchestrator\Orchestrator.cpp ^
+ *      ipc\IPCServer.cpp ^
+ *      ipc\IPCStatusServer.cpp ^
+ *      compressor\TextureCompressor.cpp ^
+ *      /I . ^
+ *      /link dxgi.lib d3d11.lib gdi32.lib ^
+ *      /OUT:vram_optimizer.exe
  */
 
-#include "monitor/VRAMMonitor.h"
-#include "orchestrator/Orchestrator.h"
-
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <chrono>
 #include <csignal>
+#include <atomic>
 #include <string>
+#include <algorithm>
 
-// ─── Sinal de parada ─────────────────────────────────────────────────────────
+#include "monitor/VRAMMonitor.h"
+#include "orchestrator/Orchestrator.h"
+#include "ipc/IPCServer.h"
+#include "ipc/IPCStatusServer.h"
+#include "ipc/IPCProtocol.h"
 
-static Orchestrator* g_orc = nullptr;
+// ─────────────────────────────────────────────────────────────────────────────
+// Parada global
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::atomic<bool> g_quit{ false };
+static Orchestrator*     g_orc  = nullptr;
 
 static void OnSignal(int) {
-    printf("\n[Main] Encerrando...\n");
+    printf("\n[Main] Ctrl+C — encerrando...\n");
+    g_quit = true;
     if (g_orc) g_orc->Stop();
 }
 
-// ─── Helper: cria textura simulada ───────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Display no CMD
+// ─────────────────────────────────────────────────────────────────────────────
 
-static TextureEntry MakeTexture(
-    uint64_t id, const char* name,
-    uint32_t w, uint32_t h,
-    TexturePriority prio)
+static void PrintStatus(const VRAMInfo& v, const OrchestratorStats& s,
+                        bool hook_ok, bool ui_ok)
+{
+    constexpr int BAR = 34;
+    int filled = std::min((int)(v.percent / 100.f * BAR), BAR);
+    char bar[BAR + 1];
+    for (int i = 0; i < BAR; i++)
+        bar[i] = i < filled ? (v.percent >= 90.f ? '!' :
+                               v.percent >= 75.f ? '#' : '=') : '.';
+    bar[BAR] = '\0';
+
+    printf("\r[%s] %5.1f%%  %.0f/%.0f MB  "
+           "tex:%llu/%llu  salvo:%.0fMB  hook:%s ui:%s   ",
+        bar, v.percent,
+        v.used_bytes  / (1024.0 * 1024.0),
+        v.total_bytes / (1024.0 * 1024.0),
+        (unsigned long long)s.compressed_textures,
+        (unsigned long long)s.total_textures,
+        s.total_saved_bytes / (1024.0 * 1024.0),
+        hook_ok ? "OK" : "--",
+        ui_ok   ? "OK" : "--");
+    fflush(stdout);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper de textura simulada
+// ─────────────────────────────────────────────────────────────────────────────
+
+static TextureEntry MakeTex(uint64_t id, const char* name,
+                             uint32_t w, uint32_t h, TexturePriority prio)
 {
     TextureEntry t;
     t.id         = id;
     t.name       = name;
     t.width      = w;
     t.height     = h;
-    t.size_bytes = (uint64_t)w * h * 4; // RGBA8 sem compressão
+    t.size_bytes = (uint64_t)w * h * 4;
     t.priority   = prio;
     return t;
 }
 
-// ─── Imprime estatísticas formatadas ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Conecta callbacks da UI → Orchestrator
+// ─────────────────────────────────────────────────────────────────────────────
 
-static void PrintStats(const VRAMInfo& vram, const OrchestratorStats& stats) {
-    // Barra de progresso
-    constexpr int BAR = 30;
-    int filled = (int)(vram.percent / 100.f * BAR);
-    char bar[BAR + 1];
-    for (int i = 0; i < BAR; i++) bar[i] = (i < filled) ? '#' : '.';
-    bar[BAR] = '\0';
+static void WireUICallbacks(IPCStatusServer& ui, Orchestrator& orc) {
+    ui.OnCommandReceived = [&orc](const char* cmd) {
+        if (strcmp(cmd, "restore_all") == 0) {
+            orc.ClearTextures();
+            printf("\n[Main] Texturas restauradas pela UI.\n");
+        }
+    };
 
-    printf("\r[%s] %5.1f%%  |  %.0f/%.0f MB  |  %llu/%llu texturas comprimidas  |  %.1f MB liberados",
-        bar,
-        vram.percent,
-        vram.used_bytes  / (1024.0 * 1024.0),
-        vram.total_bytes / (1024.0 * 1024.0),
-        (unsigned long long)stats.compressed_textures,
-        (unsigned long long)stats.total_textures,
-        stats.total_saved_bytes / (1024.0 * 1024.0));
-    fflush(stdout);
+    ui.OnConfigReceived = [&orc](const UIConfig& c) {
+        // Aplica novos thresholds nas ações do orquestrador.
+        // Abordagem simples: para, reconfigura, reinicia.
+        // Em produção: implemente Orchestrator::Reconfigure(cfg).
+        printf("\n[Main] Configuracao atualizada pela UI"
+               " (warn=%.0f low=%.0f med=%.0f emerg=%.0f).\n",
+               c.threshold_warning, c.threshold_low,
+               c.threshold_medium,  c.threshold_emergency);
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main
+// Envia snapshot do orquestrador para a UI
 // ─────────────────────────────────────────────────────────────────────────────
 
-int main() {
-    printf("=== VRAM Optimizer — Teste do Monitor + Orquestrador ===\n\n");
+static void SendToUI(IPCStatusServer& ui,
+                     const VRAMInfo& vram,
+                     const OrchestratorStats& stats,
+                     bool hook_connected)
+{
+    ui.SendSnapshot(
+        vram.percent,
+        stats.peak_vram_percent,
+        vram.used_bytes,
+        vram.total_bytes,
+        vram.free_bytes,
+        vram.backend,
+        hook_connected,
+        stats.total_saved_bytes,
+        (int)stats.total_textures,
+        (int)stats.compressed_textures,
+        (int)stats.actions_fired);
+}
 
-    // ── Configuração ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Relatório final
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void PrintReport(const Orchestrator& orc) {
+    auto s = orc.GetStats();
+    auto v = orc.GetLastVRAMInfo();
+    printf("\n\n=== Relatório Final ===\n");
+    printf("  Backend         : %s\n",     v.backend);
+    printf("  Pico VRAM       : %.1f%%\n", s.peak_vram_percent);
+    printf("  Texturas totais : %llu\n",   (unsigned long long)s.total_textures);
+    printf("  Comprimidas     : %llu\n",   (unsigned long long)s.compressed_textures);
+    printf("  Liberado        : %.1f MB\n",s.total_saved_bytes / (1024.0*1024.0));
+    printf("  Ações disparadas: %u\n",     s.actions_fired);
+    printf("  Log             : vram_optimizer.log\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RunStandalone — teste sem hook, texturas simuladas
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int RunStandalone()
+{
+    printf("==========================================================\n");
+    printf("  VRAM Optimizer  |  Standalone (sem hook DX11)\n");
+    printf("==========================================================\n\n");
+
+    OrchestratorConfig cfg;
+    cfg.monitor_interval_ms   = 500;
+    cfg.threshold_warning     = 50.f;  // limiares baixos p/ facilitar teste
+    cfg.threshold_low         = 60.f;
+    cfg.threshold_medium      = 75.f;
+    cfg.threshold_emergency   = 85.f;
+    cfg.max_compress_per_tick = 3;
+    cfg.enable_logging        = true;
+    cfg.log_to_file           = true;
+    strcpy_s(cfg.log_path, "vram_optimizer.log");
+
+    Orchestrator    orc(cfg);
+    IPCStatusServer ui;
+    g_orc = &orc;
+    signal(SIGINT, OnSignal);
+
+    WireUICallbacks(ui, orc);
+
+    orc.OnUpdate = [&](const VRAMInfo& vram, const OrchestratorStats& stats) {
+        PrintStatus(vram, stats, false, ui.IsUIConnected());
+        SendToUI(ui, vram, stats, false);
+    };
+
+    // Texturas simuladas
+    orc.RegisterTexture(MakeTex(0x1001, "tex_skybox_4k",       4096, 4096, TexturePriority::Disposable));
+    orc.RegisterTexture(MakeTex(0x1002, "tex_clouds",          2048, 2048, TexturePriority::Disposable));
+    orc.RegisterTexture(MakeTex(0x1003, "tex_arvores_dist",    1024, 1024, TexturePriority::Low));
+    orc.RegisterTexture(MakeTex(0x1004, "tex_pedras_longe",    2048, 2048, TexturePriority::Low));
+    orc.RegisterTexture(MakeTex(0x1005, "tex_terreno_a",       4096, 2048, TexturePriority::Medium));
+    orc.RegisterTexture(MakeTex(0x1006, "tex_terreno_b",       4096, 2048, TexturePriority::Medium));
+    orc.RegisterTexture(MakeTex(0x1007, "tex_npc_01",          1024,  512, TexturePriority::High));
+    orc.RegisterTexture(MakeTex(0x1008, "tex_personagem_main", 2048, 2048, TexturePriority::High));
+    orc.RegisterTexture(MakeTex(0x1009, "tex_arma",             512,  512, TexturePriority::High));
+    orc.RegisterTexture(MakeTex(0x100A, "tex_hud",              256,  256, TexturePriority::Critical));
+    orc.RegisterTexture(MakeTex(0x100B, "tex_minimapa",         512,  512, TexturePriority::Critical));
+
+    {
+        VRAMInfo tmp; VRAMMonitor m; m.Read(tmp);
+        printf("Backend : %s\n", tmp.backend);
+        printf("VRAM    : %.0f MB\n\n", tmp.total_bytes / (1024.0*1024.0));
+    }
+    printf("Ctrl+C para parar | UI C#: abra VRAMOptimizer.UI.exe\n");
+    printf("----------------------------------------------------------\n\n");
+
+    ui.Start();
+    orc.Start();
+
+    while (!g_quit.load() && orc.IsRunning())
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    ui.Stop();
+    PrintReport(orc);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RunFull — hook DX11 + UI C#
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int RunFull()
+{
+    printf("==========================================================\n");
+    printf("  VRAM Optimizer  |  Modo Completo (hook + UI)\n");
+    printf("==========================================================\n\n");
+
     OrchestratorConfig cfg;
     cfg.monitor_interval_ms   = 500;
     cfg.threshold_warning     = 70.f;
     cfg.threshold_low         = 80.f;
     cfg.threshold_medium      = 90.f;
     cfg.threshold_emergency   = 95.f;
-    cfg.max_compress_per_tick = 3;
+    cfg.max_compress_per_tick = 4;
     cfg.enable_logging        = true;
     cfg.log_to_file           = true;
     strcpy_s(cfg.log_path, "vram_optimizer.log");
 
-    // ── Cria orquestrador ─────────────────────────────────────────────────────
-    Orchestrator orc(cfg);
+    Orchestrator    orc(cfg);
+    IPCServer       hook;   // ← vram_hook.dll
+    IPCStatusServer ui;     // ← VRAMOptimizer.UI.exe
     g_orc = &orc;
     signal(SIGINT, OnSignal);
 
-    // ── Callback de atualização (será usado pela UI C# no futuro) ────────────
-    orc.OnUpdate = [](const VRAMInfo& vram, const OrchestratorStats& stats) {
-        PrintStats(vram, stats);
+    // Hook → Orquestrador
+    hook.OnTextureCreated = [&orc](const TextureCreatedEvent& e) {
+        TextureEntry t;
+        t.id         = e.texture_id;
+        t.name       = "tex_" + std::to_string(e.texture_id & 0xFFFF);
+        t.width      = e.width;
+        t.height     = e.height;
+        t.size_bytes = e.size_bytes;
+        t.priority   = e.width >= 4096 ? TexturePriority::Disposable :
+                       e.width >= 2048 ? TexturePriority::Low         :
+                       e.width >= 1024 ? TexturePriority::Medium      :
+                       e.width >=  512 ? TexturePriority::High        :
+                                         TexturePriority::Critical;
+        orc.RegisterTexture(t);
+    };
+    hook.OnTextureReleased = [&orc](const TextureReleasedEvent& e) {
+        orc.UnregisterTexture(e.texture_id);
     };
 
-    // ── Registra texturas simuladas (normalmente vindas do hook DX11) ─────────
-    printf("Registrando texturas simuladas...\n");
+    // UI → Orquestrador
+    WireUICallbacks(ui, orc);
 
-    orc.RegisterTexture(MakeTexture(0x1000, "tex_skybox_4k",      4096, 4096, TexturePriority::Disposable));
-    orc.RegisterTexture(MakeTexture(0x1001, "tex_arvore_longe",   1024, 1024, TexturePriority::Disposable));
-    orc.RegisterTexture(MakeTexture(0x1002, "tex_npc_fundo_a",    2048, 2048, TexturePriority::Low));
-    orc.RegisterTexture(MakeTexture(0x1003, "tex_npc_fundo_b",    2048, 2048, TexturePriority::Low));
-    orc.RegisterTexture(MakeTexture(0x1004, "tex_terreno_dist",   4096, 2048, TexturePriority::Medium));
-    orc.RegisterTexture(MakeTexture(0x1005, "tex_cenario_proximo",2048, 2048, TexturePriority::Medium));
-    orc.RegisterTexture(MakeTexture(0x1006, "tex_personagem",     1024,  512, TexturePriority::High));
-    orc.RegisterTexture(MakeTexture(0x1007, "tex_arma_principal",  512,  512, TexturePriority::High));
-    orc.RegisterTexture(MakeTexture(0x1008, "tex_ui_hud",          256,  256, TexturePriority::Critical));
-    orc.RegisterTexture(MakeTexture(0x1009, "tex_ui_minimapa",     512,  512, TexturePriority::Critical));
+    // Orquestrador → UI + CMD display
+    orc.OnUpdate = [&](const VRAMInfo& vram, const OrchestratorStats& stats) {
+        PrintStatus(vram, stats, hook.IsRunning(), ui.IsUIConnected());
+        SendToUI(ui, vram, stats, hook.IsRunning());
+    };
 
-    OrchestratorStats stats = orc.GetStats();
-    printf("%llu texturas registradas (%.1f MB simulados)\n\n",
-        (unsigned long long)stats.total_textures,
-        // soma estimada: calculada a partir dos tamanhos
-        (double)(4096*4096 + 1024*1024 + 2048*2048*2 + 4096*2048 + 2048*2048*2
-                 + 1024*512 + 512*512 + 256*256 + 512*512) * 4 / (1024.0*1024.0));
+    printf("Pipes ativos:\n");
+    printf("  Hook  : %s\n", PIPE_EVENTS);
+    printf("  Hook  : %s\n", PIPE_COMMANDS);
+    printf("  UI    : vram_opt_status\n");
+    printf("  UI    : vram_opt_ui_cmd\n\n");
+    printf("Passos:\n");
+    printf("  1. Abra VRAMOptimizer.UI.exe\n");
+    printf("  2. Inicie o jogo\n");
+    printf("  3. Use vram_injector.exe --inject <jogo.exe>\n\n");
+    printf("Ctrl+C para parar.\n");
+    printf("----------------------------------------------------------\n\n");
 
-    // ── Ação customizada de exemplo ────────────────────────────────────────────
-    {
-        OrchestratorAction custom;
-        custom.name            = "CustomProfileLogger";
-        custom.trigger_percent = 75.f;
-        custom.cooldown_sec    = 15.f;
-        custom.execute = [](const VRAMInfo& info, std::vector<TextureEntry>& textures) -> uint64_t {
-            printf("\n[Custom] Perfil de texturas em %.1f%% de VRAM:\n", info.percent);
-            for (const auto& t : textures) {
-                printf("  %-30s  %5.1f MB  pri=%d  comp=%s\n",
-                    t.name.c_str(),
-                    t.size_bytes / (1024.0 * 1024.0),
-                    (int)t.priority,
-                    t.compression != CompressionLevel::None ? "SIM" : "nao");
-            }
-            return 0;
-        };
-        orc.AddAction(std::move(custom));
-    }
-
-    // ── Inicia monitoramento ─────────────────────────────────────────────────
-    printf("Monitorando VRAM... (Ctrl+C para parar)\n");
-    printf("─────────────────────────────────────────────────────────────────\n");
+    ui.Start();
+    hook.Start();
     orc.Start();
 
-    // Aguarda o orquestrador terminar (parado por Ctrl+C ou pelo OnSignal)
-    while (orc.IsRunning()) {
+    while (!g_quit.load() && orc.IsRunning())
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
 
-    // ── Relatório final ───────────────────────────────────────────────────────
-    stats = orc.GetStats();
-    printf("\n\n=== Relatório Final ===\n");
-    printf("  Texturas totais:          %llu\n", (unsigned long long)stats.total_textures);
-    printf("  Texturas comprimidas:     %llu\n", (unsigned long long)stats.compressed_textures);
-    printf("  Total liberado (estimado):%.1f MB\n", stats.total_saved_bytes / (1024.0*1024.0));
-    printf("  Ações disparadas:         %u\n",   stats.actions_fired);
-    printf("  Pico de uso de VRAM:      %.1f%%\n", stats.peak_vram_percent);
-    printf("  Log salvo em:             vram_optimizer.log\n");
-
+    ui.Stop();
+    hook.Stop();
+    PrintReport(orc);
     return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
+
+int main(int argc, char* argv[])
+{
+    bool standalone = false;
+    for (int i = 1; i < argc; ++i)
+        if (strcmp(argv[i], "--standalone") == 0) standalone = true;
+    return standalone ? RunStandalone() : RunFull();
 }
