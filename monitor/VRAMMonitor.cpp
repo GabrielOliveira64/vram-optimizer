@@ -1,29 +1,25 @@
 /*
  * VRAMMonitor.cpp
  * ─────────────────────────────────────────────────────────────────────────────
- * Implementação dos três backends de leitura de VRAM.
- *
- * Ordem de inicialização:
- *   1. NVAPI  (Nvidia, mais completo)
- *   2. D3DKMT (Windows KMT — funciona para AMD e Intel também)
- *   3. DXGI   (fallback, menos granular)
+ * Backend NVAPI (opcional) + DXGI 1.4 (padrão).
+ * Sem d3dkmthk.h — compatível com Windows SDK 10.0.26100+.
  */
 
 #include "VRAMMonitor.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+// windows.h já veio do header; incluímos DXGI diretamente
 #include <dxgi.h>
-#include <d3dkmthk.h>   // D3DKMT — Windows SDK
+#include <dxgi1_4.h>    // IDXGIAdapter3::QueryVideoMemoryInfo
 #include <cstdio>
 #include <cstring>
 #include <thread>
 #include <chrono>
 
-// ─── NVAPI — carregado dinamicamente para não exigir o SDK em tempo de link ──
-// Se você tiver o SDK: #define VRAM_USE_NVAPI 1 e linke nvapi64.lib
+#pragma comment(lib, "dxgi.lib")
+
 #ifdef VRAM_USE_NVAPI
 #   include <nvapi.h>
+#   pragma comment(lib, "nvapi64.lib")
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -35,12 +31,11 @@ VRAMMonitor::VRAMMonitor(float threshold_percent, int gpu_index)
     , m_gpu_index(gpu_index)
 {
 #ifdef VRAM_USE_NVAPI
-    if (InitNVAPI())  { m_backend = Backend::NVAPI;  return; }
+    if (InitNVAPI()) { m_backend = Backend::NVAPI; return; }
 #endif
-    if (InitD3DKMT()) { m_backend = Backend::D3DKMT; return; }
-    if (InitDXGI())   { m_backend = Backend::DXGI;   return; }
+    if (InitDXGI())  { return; } // InitDXGI define m_backend internamente
 
-    fprintf(stderr, "[VRAMMonitor] AVISO: nenhum backend disponivel.\n");
+    fprintf(stderr, "[VRAMMonitor] Nenhum backend disponivel.\n");
 }
 
 VRAMMonitor::~VRAMMonitor() {
@@ -51,6 +46,7 @@ VRAMMonitor::~VRAMMonitor() {
         NvAPI_Unload();
     }
 #endif
+
     if (m_dxgi_adapter) {
         reinterpret_cast<IDXGIAdapter*>(m_dxgi_adapter)->Release();
         m_dxgi_adapter = nullptr;
@@ -58,7 +54,7 @@ VRAMMonitor::~VRAMMonitor() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Inicialização dos backends
+// InitNVAPI
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool VRAMMonitor::InitNVAPI() {
@@ -78,80 +74,80 @@ bool VRAMMonitor::InitNVAPI() {
 #endif
 }
 
-bool VRAMMonitor::InitD3DKMT() {
-    // Tenta obter o adapter handle via D3DKMTOpenAdapterFromLuid
-    // Enumeramos via DXGI para pegar o LUID e depois abrimos via KMT
-    IDXGIFactory* factory = nullptr;
-    if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
-        return false;
-
-    IDXGIAdapter* adapter = nullptr;
-    HRESULT hr = factory->EnumAdapters((UINT)m_gpu_index, &adapter);
-    factory->Release();
-    if (FAILED(hr)) return false;
-
-    DXGI_ADAPTER_DESC desc = {};
-    adapter->GetDesc(&desc);
-    adapter->Release();
-
-    D3DKMT_OPENADAPTERFROMLUID open_args = {};
-    open_args.AdapterLuid = desc.AdapterLuid;
-
-    // D3DKMTOpenAdapterFromLuid é exportada por gdi32.dll
-    HMODULE gdi = GetModuleHandleA("gdi32.dll");
-    if (!gdi) return false;
-
-    using PFN_OpenAdapterFromLuid = NTSTATUS(APIENTRY*)(D3DKMT_OPENADAPTERFROMLUID*);
-    auto fn = reinterpret_cast<PFN_OpenAdapterFromLuid>(
-        GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"));
-    if (!fn) return false;
-
-    if (fn(&open_args) != 0) return false;
-
-    m_d3dkmt_handle = open_args.hAdapter;
-    printf("[VRAMMonitor] Backend: D3DKMT (GPU %d — %S)\n",
-           m_gpu_index, desc.Description);
-    return true;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// InitDXGI — tenta DXGI 1.4 (QueryVideoMemoryInfo), cai para DXGI 1.0
+// ─────────────────────────────────────────────────────────────────────────────
 
 bool VRAMMonitor::InitDXGI() {
-    IDXGIFactory* factory = nullptr;
-    if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
-        return false;
+    // Tenta criar IDXGIFactory2 (DXGI 1.2+) para chegar ao IDXGIAdapter3
+    IDXGIFactory2* factory2 = nullptr;
+    IDXGIFactory*  factory1 = nullptr;
+    IDXGIAdapter*  adapter  = nullptr;
 
-    IDXGIAdapter* adapter = nullptr;
-    HRESULT hr = factory->EnumAdapters((UINT)m_gpu_index, &adapter);
-    factory->Release();
-    if (FAILED(hr)) return false;
+    // Tenta DXGI 1.2+ primeiro
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&factory2);
+    if (SUCCEEDED(hr)) {
+        IDXGIAdapter1* adapter1 = nullptr;
+        hr = factory2->EnumAdapters1((UINT)m_gpu_index, &adapter1);
+        factory2->Release();
 
-    m_dxgi_adapter = adapter; // guardamos a referência
+        if (SUCCEEDED(hr)) {
+            // Tenta promover para IDXGIAdapter3
+            IDXGIAdapter3* adapter3 = nullptr;
+            if (SUCCEEDED(adapter1->QueryInterface(__uuidof(IDXGIAdapter3),
+                                                   (void**)&adapter3)))
+            {
+                m_dxgi_adapter = adapter3;  // guarda como IDXGIAdapter3
+                m_dxgi14       = true;
+                adapter1->Release();
+
+                DXGI_ADAPTER_DESC desc = {};
+                adapter3->GetDesc(&desc);
+                printf("[VRAMMonitor] Backend: DXGI 1.4 (GPU %d — %S)\n",
+                       m_gpu_index, desc.Description);
+                m_backend = Backend::DXGI14;
+                return true;
+            }
+            adapter = adapter1; // fallback para DXGI 1.0
+        }
+    }
+
+    // Fallback: DXGI 1.0
+    if (!adapter) {
+        hr = CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory1);
+        if (FAILED(hr)) return false;
+        hr = factory1->EnumAdapters((UINT)m_gpu_index, &adapter);
+        factory1->Release();
+        if (FAILED(hr)) return false;
+    }
+
+    m_dxgi_adapter = adapter;
+    m_dxgi14       = false;
+    m_backend      = Backend::DXGI10;
 
     DXGI_ADAPTER_DESC desc = {};
     adapter->GetDesc(&desc);
-    printf("[VRAMMonitor] Backend: DXGI (GPU %d — %S)\n",
+    printf("[VRAMMonitor] Backend: DXGI 1.0 fallback (GPU %d — %S)\n",
            m_gpu_index, desc.Description);
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Leitura por backend
+// ReadNVAPI
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool VRAMMonitor::ReadNVAPI(VRAMInfo& out) const {
 #ifdef VRAM_USE_NVAPI
     auto handle = reinterpret_cast<NvPhysicalGpuHandle>(m_nvapi_handle);
+    NV_DISPLAY_DRIVER_MEMORY_INFO mem = {};
+    mem.version = NV_DISPLAY_DRIVER_MEMORY_INFO_VER;
+    if (NvAPI_GPU_GetMemoryInfo(handle, &mem) != NVAPI_OK) return false;
 
-    // Memória dedicada
-    NV_DISPLAY_DRIVER_MEMORY_INFO mem_info = {};
-    mem_info.version = NV_DISPLAY_DRIVER_MEMORY_INFO_VER;
-    if (NvAPI_GPU_GetMemoryInfo(handle, &mem_info) != NVAPI_OK) return false;
-
-    out.total_bytes = (uint64_t)mem_info.dedicatedVideoMemory * 1024ULL;
-    out.free_bytes  = (uint64_t)mem_info.curAvailableDedicatedVideoMemory * 1024ULL;
+    out.total_bytes = (uint64_t)mem.dedicatedVideoMemory * 1024ULL;
+    out.free_bytes  = (uint64_t)mem.curAvailableDedicatedVideoMemory * 1024ULL;
     out.used_bytes  = out.total_bytes - out.free_bytes;
     out.percent     = out.total_bytes > 0
-                      ? (float)out.used_bytes / out.total_bytes * 100.f
-                      : 0.f;
+                      ? (float)out.used_bytes / out.total_bytes * 100.f : 0.f;
     out.is_critical = out.percent >= m_threshold;
     strcpy_s(out.backend, "NVAPI");
     return true;
@@ -160,70 +156,43 @@ bool VRAMMonitor::ReadNVAPI(VRAMInfo& out) const {
 #endif
 }
 
-bool VRAMMonitor::ReadD3DKMT(VRAMInfo& out) const {
-    // Consulta segmentos de memória via D3DKMTQueryStatistics
-    D3DKMT_QUERYSTATISTICS qs = {};
-    qs.Type    = D3DKMT_QUERYSTATISTICS_SEGMENT;
-    qs.AdapterLuid; // preenchido via handle — veja nota abaixo
-
-    // NOTA: D3DKMT_QUERYSTATISTICS precisa do LUID, não do handle direto.
-    // Versão simplificada via D3DKMTQueryAdapterInfo para budget:
-    HMODULE gdi = GetModuleHandleA("gdi32.dll");
-    if (!gdi) return false;
-
-    using PFN_QueryAdapterInfo = NTSTATUS(APIENTRY*)(const D3DKMT_QUERYADAPTERINFO*);
-    auto fn_query = reinterpret_cast<PFN_QueryAdapterInfo>(
-        GetProcAddress(gdi, "D3DKMTQueryAdapterInfo"));
-    if (!fn_query) return false;
-
-    // Consulta DXGI_QUERY_VIDEO_MEMORY_INFO via KMT
-    DXGI_QUERY_VIDEO_MEMORY_INFO vmi_local  = {};
-    DXGI_QUERY_VIDEO_MEMORY_INFO vmi_nonlocal = {};
-
-    D3DKMT_QUERYADAPTERINFO qi_local = {};
-    qi_local.hAdapter = m_d3dkmt_handle;
-    qi_local.Type     = KMTQAITYPE_QUERYREGISTRY; // fallback: usa DXGI abaixo
-
-    // Fallback limpo: se D3DKMT não conseguir os dados, delega para DXGI
-    // (na prática D3DKMT é mais complexo; para produção use a lib DXGI 1.4+)
-    if (m_dxgi_adapter) return ReadDXGI(out);
-
-    return false;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// ReadDXGI — usa DXGI 1.4 se disponível, senão DXGI 1.0 (só total)
+// ─────────────────────────────────────────────────────────────────────────────
 
 bool VRAMMonitor::ReadDXGI(VRAMInfo& out) const {
-    // DXGI 1.4 introduziu QueryVideoMemoryInfo — mais preciso que GetDesc
-    IDXGIAdapter3* adapter3 = nullptr;
-    auto* adapter = reinterpret_cast<IDXGIAdapter*>(m_dxgi_adapter);
+    if (!m_dxgi_adapter) return false;
 
-    if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&adapter3))) {
-        // Memória local (VRAM dedicada)
+    if (m_dxgi14) {
+        // IDXGIAdapter3::QueryVideoMemoryInfo — leitura precisa de uso atual
+        auto* adapter3 = reinterpret_cast<IDXGIAdapter3*>(m_dxgi_adapter);
         DXGI_QUERY_VIDEO_MEMORY_INFO local_info = {};
-        adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info);
-        adapter3->Release();
+        HRESULT hr = adapter3->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info);
+        if (FAILED(hr)) return false;
 
         out.total_bytes = local_info.Budget;
         out.used_bytes  = local_info.CurrentUsage;
-        out.free_bytes  = (out.total_bytes > out.used_bytes)
+        out.free_bytes  = out.total_bytes > out.used_bytes
                           ? out.total_bytes - out.used_bytes : 0;
         out.percent     = out.total_bytes > 0
-                          ? (float)out.used_bytes / out.total_bytes * 100.f
-                          : 0.f;
+                          ? (float)out.used_bytes / out.total_bytes * 100.f : 0.f;
         out.is_critical = out.percent >= m_threshold;
         strcpy_s(out.backend, "DXGI 1.4");
         return true;
     }
 
-    // Fallback: GetDesc (total apenas, sem uso atual — menos útil)
+    // DXGI 1.0 — só tem o total de VRAM dedicada (DedicatedVideoMemory)
+    auto* adapter = reinterpret_cast<IDXGIAdapter*>(m_dxgi_adapter);
     DXGI_ADAPTER_DESC desc = {};
     if (FAILED(adapter->GetDesc(&desc))) return false;
 
     out.total_bytes = desc.DedicatedVideoMemory;
-    out.used_bytes  = 0; // indisponível neste fallback
+    out.used_bytes  = 0;   // indisponível no DXGI 1.0
     out.free_bytes  = out.total_bytes;
     out.percent     = 0.f;
     out.is_critical = false;
-    strcpy_s(out.backend, "DXGI 1.0 (fallback)");
+    strcpy_s(out.backend, "DXGI 1.0");
     return true;
 }
 
@@ -234,8 +203,8 @@ bool VRAMMonitor::ReadDXGI(VRAMInfo& out) const {
 bool VRAMMonitor::Read(VRAMInfo& out) const {
     switch (m_backend) {
         case Backend::NVAPI:  return ReadNVAPI(out);
-        case Backend::D3DKMT: return ReadD3DKMT(out);
-        case Backend::DXGI:   return ReadDXGI(out);
+        case Backend::DXGI14: return ReadDXGI(out);
+        case Backend::DXGI10: return ReadDXGI(out);
         default:              return false;
     }
 }
@@ -244,9 +213,7 @@ void VRAMMonitor::Watch(VRAMCallback cb, uint32_t interval_ms) {
     m_running = true;
     while (m_running) {
         VRAMInfo info = {};
-        if (Read(info)) {
-            cb(info);
-        }
+        if (Read(info)) cb(info);
         std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
     }
 }
@@ -258,8 +225,8 @@ void VRAMMonitor::Stop() {
 const char* VRAMMonitor::ActiveBackend() const {
     switch (m_backend) {
         case Backend::NVAPI:  return "NVAPI";
-        case Backend::D3DKMT: return "D3DKMT";
-        case Backend::DXGI:   return "DXGI";
+        case Backend::DXGI14: return "DXGI 1.4";
+        case Backend::DXGI10: return "DXGI 1.0";
         default:              return "None";
     }
 }

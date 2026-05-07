@@ -12,6 +12,7 @@
  */
 
 #include "TextureCompressor.h"
+#define NOMINMAX        // evita macros min/max do Windows
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -135,11 +136,10 @@ CompressResult TextureCompressor::CompressBC1(
     if (!rgba || w == 0 || h == 0)
         return MakeError("CompressBC1: parametros invalidos");
 
-    // Dimensões devem ser múltiplas de 4
+#ifdef VRAM_USE_ISPC
+    // Dimensões devem ser múltiplas de 4 (só necessário para o path ISPC)
     uint32_t aw = AlignUp(w, 4);
     uint32_t ah = AlignUp(h, 4);
-
-#ifdef VRAM_USE_ISPC
     // ── Caminho rápido: ispc_texcomp ─────────────────────────────────────────
     rgba_surface surface{};
     surface.ptr    = const_cast<uint8_t*>(rgba);

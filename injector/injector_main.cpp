@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <algorithm>   // std::transform
 #include <thread>
 #include <chrono>
 #include <atomic>

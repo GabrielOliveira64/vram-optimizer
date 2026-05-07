@@ -68,11 +68,11 @@
             </Grid.ColumnDefinitions>
 
             <!-- ── COLUNA ESQUERDA ──────────────────────────────────── -->
-            <StackPanel Grid.Column="0" Spacing="10">
+            <StackPanel Grid.Column="0">
 
                 <!-- Card: VRAM -->
                 <Border Background="{StaticResource BrBgCard}"
-                        CornerRadius="10" Padding="16">
+                        CornerRadius="10" Padding="16" Margin="0,0,0,10">
                     <StackPanel>
                         <TextBlock Text="MEMÓRIA DE VÍDEO" FontSize="10" FontWeight="Bold"
                                    Foreground="{StaticResource BrTextSec}"
@@ -128,7 +128,7 @@
 
                 <!-- Card: Injeção -->
                 <Border Background="{StaticResource BrBgCard}"
-                        CornerRadius="10" Padding="16">
+                        CornerRadius="10" Padding="16" Margin="0,0,0,10">
                     <StackPanel>
                         <TextBlock Text="INJEÇÃO NO JOGO" FontSize="10" FontWeight="Bold"
                                    Foreground="{StaticResource BrTextSec}"
