@@ -5,11 +5,13 @@
  * Ambos os .cpp são compilados juntos na mesma DLL.
  */
 
+#define NOMINMAX
 #include "HookDX11.h"
 #include "../ipc/IPCProtocol.h"
-#include <dxgi1_4.h>   // IDXGIAdapter3 para QueryVideoMemoryInfo
+#include <dxgi1_4.h>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilitários de textura
@@ -58,8 +60,8 @@ static uint64_t CalcTextureSize(const D3D11_TEXTURE2D_DESC& desc) {
                 break;
         }
         total += mip_size * desc.ArraySize;
-        w = max(1u, w / 2);
-        h = max(1u, h / 2);
+        w = std::max(1u, w / 2);
+        h = std::max(1u, h / 2);
     }
     return total;
 }
@@ -221,8 +223,8 @@ void HookDX11::ApplyCompression(uint64_t texture_id, uint32_t level,
         new_desc.Height = (target_h + 3) & ~3u;
     } else {
         // Reduz à metade (HalfRes)
-        new_desc.Width  = max(4u, (new_desc.Width  / 2 + 3) & ~3u);
-        new_desc.Height = max(4u, (new_desc.Height / 2 + 3) & ~3u);
+        new_desc.Width  = std::max(4u, (new_desc.Width  / 2 + 3) & ~3u);
+        new_desc.Height = std::max(4u, (new_desc.Height / 2 + 3) & ~3u);
     }
 
     // Converte para formato comprimido
@@ -243,8 +245,8 @@ void HookDX11::ApplyCompression(uint64_t texture_id, uint32_t level,
                 new_desc.Format = DXGI_FORMAT_BC7_UNORM;
             break;
         case IPCCompressionLevel::QuarterRes:
-            new_desc.Width  = max(4u, (entry->orig_desc.Width  / 4 + 3) & ~3u);
-            new_desc.Height = max(4u, (entry->orig_desc.Height / 4 + 3) & ~3u);
+            new_desc.Width  = std::max(4u, (entry->orig_desc.Width  / 4 + 3) & ~3u);
+            new_desc.Height = std::max(4u, (entry->orig_desc.Height / 4 + 3) & ~3u);
             break;
         default:
             break;

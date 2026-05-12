@@ -134,11 +134,24 @@
                                    Foreground="{StaticResource BrTextSec}"
                                    Margin="0,0,0,10"/>
 
-                        <TextBlock Text="Processo (.exe)" FontSize="11"
+                        <!-- Lista de processos com janela -->
+                        <TextBlock Text="Selecionar processo" FontSize="11"
+                                   Foreground="{StaticResource BrTextSec}"
+                                   Margin="0,0,0,4"/>
+                        <ListBox x:Name="ListProcesses" Height="90"
+                                 Background="{StaticResource BrBgDark}"
+                                 Foreground="{StaticResource BrTextPrimary}"
+                                 BorderBrush="{StaticResource BrBorder}"
+                                 BorderThickness="1"
+                                 DisplayMemberPath="Display"
+                                 Margin="0,0,0,6"
+                                 SelectionChanged="ListProcesses_SelectionChanged"/>
+
+                        <TextBlock Text="Nome do processo (.exe)" FontSize="11"
                                    Foreground="{StaticResource BrTextSec}"
                                    Margin="0,0,0,4"/>
                         <TextBox x:Name="TxtProcessName"
-                                 Text="eldenring.exe"
+                                 Text=""
                                  Margin="0,0,0,10"/>
 
                         <TextBlock Text="Caminho da DLL" FontSize="11"
@@ -154,7 +167,7 @@
                             <Button Grid.Column="2" Content="..." Width="32"
                                     Style="{StaticResource BtnSecondary}"
                                     Click="BtnBrowseDll_Click"
-                                    Padding="4,6" ToolTip="Procurar DLL"/>
+                                    Padding="4,6"/>
                         </Grid>
 
                         <CheckBox x:Name="ChkWatchMode"

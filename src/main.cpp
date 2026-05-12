@@ -251,7 +251,7 @@ static int RunFull()
     g_orc = &orc;
     signal(SIGINT, OnSignal);
 
-    // Hook → Orquestrador
+    // Hook → Orquestrador: textura criada
     hook.OnTextureCreated = [&orc](const TextureCreatedEvent& e) {
         TextureEntry t;
         t.id         = e.texture_id;
@@ -266,8 +266,28 @@ static int RunFull()
                                          TexturePriority::Critical;
         orc.RegisterTexture(t);
     };
+
+    // Hook → Orquestrador: textura destruída
     hook.OnTextureReleased = [&orc](const TextureReleasedEvent& e) {
         orc.UnregisterTexture(e.texture_id);
+    };
+
+    // Hook → Orquestrador: snapshot de VRAM lido de DENTRO do jogo
+    // Sobrescreve a leitura do VRAMMonitor com valores reais do processo do jogo
+    hook.OnVRAMSnapshot = [&ui](const VRAMSnapshotEvent& e) {
+        // Envia direto para a UI sem passar pelo VRAMMonitor
+        // (que leria o uso do próprio processo do orquestrador)
+        static uint32_t action_count = 0;
+        ui.SendSnapshot(
+            e.budget_bytes > 0
+                ? (float)e.used_bytes / e.budget_bytes * 100.f : 0.f,
+            0.f,  // peak calculado na UI
+            e.used_bytes,
+            e.budget_bytes,
+            e.budget_bytes > e.used_bytes ? e.budget_bytes - e.used_bytes : 0,
+            "DXGI (in-process)",
+            true,   // hook conectado
+            0, 0, 0, 0);
     };
 
     // UI → Orquestrador

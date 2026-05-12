@@ -21,12 +21,14 @@
  *   O hook de PSSetShaderResources substitui automaticamente na hora do draw.
  */
 
+#define NOMINMAX
 #include "HookDX11.h"
 #include "../compressor/TextureCompressor.h"
 #include "../ipc/IPCProtocol.h"
 #include <MinHook.h>
 #include <d3d11.h>
 #include <cstring>
+#include <algorithm>
 #include <unordered_map>
 #include <mutex>
 

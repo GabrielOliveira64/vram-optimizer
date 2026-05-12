@@ -163,37 +163,49 @@ bool VRAMMonitor::ReadNVAPI(VRAMInfo& out) const {
 bool VRAMMonitor::ReadDXGI(VRAMInfo& out) const {
     if (!m_dxgi_adapter) return false;
 
+    // Pega o total real de VRAM dedicada via GetDesc() — sempre confiável
+    DXGI_ADAPTER_DESC desc = {};
     if (m_dxgi14) {
-        // IDXGIAdapter3::QueryVideoMemoryInfo — leitura precisa de uso atual
+        auto* a3 = reinterpret_cast<IDXGIAdapter3*>(m_dxgi_adapter);
+        a3->GetDesc(&desc);
+    } else {
+        auto* a = reinterpret_cast<IDXGIAdapter*>(m_dxgi_adapter);
+        a->GetDesc(&desc);
+    }
+    uint64_t dedicated = desc.DedicatedVideoMemory;
+
+    if (m_dxgi14) {
         auto* adapter3 = reinterpret_cast<IDXGIAdapter3*>(m_dxgi_adapter);
         DXGI_QUERY_VIDEO_MEMORY_INFO local_info = {};
         HRESULT hr = adapter3->QueryVideoMemoryInfo(
             0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info);
-        if (FAILED(hr)) return false;
 
-        out.total_bytes = local_info.Budget;
-        out.used_bytes  = local_info.CurrentUsage;
-        out.free_bytes  = out.total_bytes > out.used_bytes
-                          ? out.total_bytes - out.used_bytes : 0;
-        out.percent     = out.total_bytes > 0
-                          ? (float)out.used_bytes / out.total_bytes * 100.f : 0.f;
-        out.is_critical = out.percent >= m_threshold;
-        strcpy_s(out.backend, "DXGI 1.4");
-        return true;
+        if (SUCCEEDED(hr)) {
+            // Budget pode ser menor que DedicatedVideoMemory se o sistema
+            // reservou parte. Usa o maior entre os dois como "total visível".
+            uint64_t budget = local_info.Budget;
+            out.total_bytes = (dedicated > budget && dedicated > 0)
+                              ? dedicated : (budget > 0 ? budget : dedicated);
+            out.used_bytes  = local_info.CurrentUsage;
+            out.free_bytes  = out.total_bytes > out.used_bytes
+                              ? out.total_bytes - out.used_bytes : 0;
+            out.percent     = out.total_bytes > 0
+                              ? (float)out.used_bytes / out.total_bytes * 100.f
+                              : 0.f;
+            out.is_critical = out.percent >= m_threshold;
+            strcpy_s(out.backend, "DXGI 1.4");
+            return true;
+        }
     }
 
-    // DXGI 1.0 — só tem o total de VRAM dedicada (DedicatedVideoMemory)
-    auto* adapter = reinterpret_cast<IDXGIAdapter*>(m_dxgi_adapter);
-    DXGI_ADAPTER_DESC desc = {};
-    if (FAILED(adapter->GetDesc(&desc))) return false;
-
-    out.total_bytes = desc.DedicatedVideoMemory;
-    out.used_bytes  = 0;   // indisponível no DXGI 1.0
-    out.free_bytes  = out.total_bytes;
+    // DXGI 1.0 fallback — reporta total mas não tem uso atual
+    out.total_bytes = dedicated;
+    out.used_bytes  = 0;
+    out.free_bytes  = dedicated;
     out.percent     = 0.f;
     out.is_critical = false;
     strcpy_s(out.backend, "DXGI 1.0");
-    return true;
+    return dedicated > 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

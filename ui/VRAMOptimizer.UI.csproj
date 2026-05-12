@@ -8,8 +8,8 @@
     <UseWPF>true</UseWPF>
     <AssemblyName>VRAMOptimizer.UI</AssemblyName>
     <RootNamespace>VRAMOptimizer.UI</RootNamespace>
-    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
+    <NoWarn>CS0067;CS0414;CS4014</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

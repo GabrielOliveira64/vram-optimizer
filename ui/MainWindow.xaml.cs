@@ -1,9 +1,10 @@
 /*
- * MainWindow.xaml.cs
- * ─────────────────────────────────────────────────────────────────────────────
- * Code-behind da janela principal.
- * Comunica-se com o orquestrador C++ via Named Pipe (IPCClient).
- * Toda atualização de UI vem de um DispatcherTimer que lê o IPCClient.
+ * MainWindow.xaml.cs — v2
+ * Correções:
+ *   - Reconexão automática ao orquestrador via pipe (retry a cada 2s)
+ *   - Seleção de processo do jogo via lista (ProcessPicker)
+ *   - Injeção automática quando processo é selecionado
+ *   - UI atualiza mesmo quando orquestrador está no modo standalone
  */
 
 using System;
@@ -13,7 +14,6 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -30,7 +30,8 @@ using SkiaSharp;
 
 namespace VRAMOptimizer.UI;
 
-// ─── ViewModel de uma textura (para a lista) ──────────────────────────────────
+// ─── ViewModels ───────────────────────────────────────────────────────────────
+
 public class TextureViewModel
 {
     public string Name        { get; set; } = "";
@@ -41,8 +42,14 @@ public class TextureViewModel
     public string SavedMB     { get; set; } = "";
 }
 
-// ─── ViewModel do gráfico (LiveCharts2) ──────────────────────────────────────
-public class ChartViewModel : INotifyPropertyChanged
+public class ProcessViewModel
+{
+    public uint   PID     { get; set; }
+    public string Name    { get; set; } = "";
+    public string Display => $"{Name}  (PID {PID})";
+}
+
+public class ChartViewModel
 {
     private readonly ObservableCollection<ObservableValue> _values = new();
 
@@ -50,39 +57,25 @@ public class ChartViewModel : INotifyPropertyChanged
     public Axis[]    XAxes       { get; }
     public Axis[]    YAxes       { get; }
 
-    public event PropertyChangedEventHandler? PropertyChanged;
-
     public ChartViewModel()
     {
-        // Pré-popula com 60 pontos em zero
-        for (int i = 0; i < 60; i++)
-            _values.Add(new ObservableValue(0));
+        for (int i = 0; i < 60; i++) _values.Add(new ObservableValue(0));
 
         ChartSeries = new ISeries[]
         {
             new LineSeries<ObservableValue>
             {
-                Values          = _values,
-                Name            = "VRAM %",
-                Stroke          = new SolidColorPaint(SKColor.Parse("#4F8EF7"), 2),
-                Fill            = new LinearGradientPaint(
+                Values         = _values,
+                Name           = "VRAM %",
+                Stroke         = new SolidColorPaint(SKColor.Parse("#4F8EF7"), 2),
+                Fill           = new LinearGradientPaint(
                     new[] { SKColor.Parse("#334F8EF7"), SKColor.Parse("#004F8EF7") },
-                    new SKPoint(0, 0), new SKPoint(0, 1)),
-                GeometrySize    = 0,
-                LineSmoothness  = 0.5,
+                    new SKPoint(0,0), new SKPoint(0,1)),
+                GeometrySize   = 0,
+                LineSmoothness = 0.4,
             }
         };
-
-        XAxes = new Axis[]
-        {
-            new Axis
-            {
-                Labels          = null,
-                IsVisible       = false,
-                SeparatorsPaint = null,
-            }
-        };
-
+        XAxes = new Axis[] { new Axis { IsVisible = false, SeparatorsPaint = null } };
         YAxes = new Axis[]
         {
             new Axis
@@ -96,97 +89,93 @@ public class ChartViewModel : INotifyPropertyChanged
         };
     }
 
-    public void AddPoint(double percent)
-    {
+    public void AddPoint(double pct) {
         _values.RemoveAt(0);
-        _values.Add(new ObservableValue(percent));
+        _values.Add(new ObservableValue(Math.Clamp(pct, 0, 100)));
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MainWindow
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── MainWindow ───────────────────────────────────────────────────────────────
 
 public partial class MainWindow : Window
 {
-    // ── State ─────────────────────────────────────────────────────────────────
     private readonly ChartViewModel _chartVm = new();
-    private readonly ObservableCollection<TextureViewModel> _textures = new();
-    private readonly DispatcherTimer _uiTimer   = new();
-    private readonly DispatcherTimer _clockTimer = new();
+    private readonly ObservableCollection<TextureViewModel>  _textures  = new();
+    private readonly ObservableCollection<ProcessViewModel>  _processes = new();
 
-    // IPC com o orquestrador C++ (Named Pipe)
-    private IPCClient?       _ipc;
+    private readonly DispatcherTimer _uiTimer      = new();
+    private readonly DispatcherTimer _clockTimer   = new();
+    private readonly DispatcherTimer _connectTimer = new();
+    private readonly DispatcherTimer _procTimer    = new();
+
+    private IPCClient?               _ipc;
     private CancellationTokenSource? _ipcCts;
+    private Process?                 _orchProcess;
+    private Process?                 _watchProcess;
 
-    // Processo do orquestrador (se lançado por nós)
-    private Process? _orchProcess;
-
-    // Injetor gerenciado (chama vram_injector.exe via Process)
-    private Process?  _watchProcess;
-    private bool      _watchRunning;
-
-    // Tab ativa
-    private FrameworkElement? _activePanel;
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Construtor
-    // ─────────────────────────────────────────────────────────────────────────
+    // Caminho base onde ficam os executáveis C++
+    private string BasePath => Path.Combine(
+        AppDomain.CurrentDomain.BaseDirectory,
+        "..","..","..","..","build","Release");
 
     public MainWindow()
     {
         InitializeComponent();
         DataContext = _chartVm;
-
-        ListTextures.ItemsSource = _textures;
+        ListTextures.ItemsSource  = _textures;
+        ListProcesses.ItemsSource = _processes;
 
         // Tab padrão
-        _activePanel = PanelConfig;
+        ShowTab(PanelConfig, TabBtnConfig);
 
-        // Timer de atualização da UI (500ms)
+        // Relógio
+        _clockTimer.Interval = TimeSpan.FromSeconds(1);
+        _clockTimer.Tick    += (_, _) => TxtClock.Text = DateTime.Now.ToString("HH:mm:ss");
+        _clockTimer.Start();
+
+        // Timer de atualização da UI (lê dados do pipe)
         _uiTimer.Interval = TimeSpan.FromMilliseconds(500);
         _uiTimer.Tick    += OnUITick;
 
-        // Timer do relógio
-        _clockTimer.Interval = TimeSpan.FromSeconds(1);
-        _clockTimer.Tick    += (_, _) =>
-            TxtClock.Text = DateTime.Now.ToString("HH:mm:ss");
-        _clockTimer.Start();
+        // Timer de reconexão automática ao pipe (tenta a cada 2s)
+        _connectTimer.Interval = TimeSpan.FromSeconds(2);
+        _connectTimer.Tick    += OnConnectTick;
+        _connectTimer.Start();
 
-        // Inicia IPC e orquestrador automaticamente se configurado
+        // Timer de atualização da lista de processos (a cada 3s)
+        _procTimer.Interval = TimeSpan.FromSeconds(3);
+        _procTimer.Tick    += OnProcessTick;
+        _procTimer.Start();
+
         if (ChkAutoStart.IsChecked == true)
             StartOrchestrator();
 
-        AppendLog("Interface iniciada.");
-        SetStatus("Pronto. Configure os parâmetros e injete a DLL no jogo.");
+        AppendLog("Interface iniciada. Aguardando orquestrador...");
+        SetStatus("Aguardando conexão com o orquestrador.");
     }
 
     protected override void OnClosing(CancelEventArgs e)
     {
         _uiTimer.Stop();
         _clockTimer.Stop();
+        _connectTimer.Stop();
+        _procTimer.Stop();
         _ipcCts?.Cancel();
         _watchProcess?.Kill();
         _orchProcess?.Kill();
         base.OnClosing(e);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Orquestrador C++ — lança vram_optimizer.exe em background
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Orquestrador ─────────────────────────────────────────────────────────
 
     private void StartOrchestrator()
     {
-        string orchPath = Path.Combine(
-            AppDomain.CurrentDomain.BaseDirectory, "vram_optimizer.exe");
-
+        string orchPath = Path.GetFullPath(Path.Combine(BasePath, "vram_optimizer.exe"));
         if (!File.Exists(orchPath))
         {
             AppendLog($"[AVISO] vram_optimizer.exe não encontrado em:\n  {orchPath}");
-            AppendLog("  Compile o projeto C++ e coloque o .exe na mesma pasta que a UI.");
             return;
         }
-
         try
         {
             _orchProcess = new Process
@@ -196,7 +185,6 @@ public partial class MainWindow : Window
                     FileName               = orchPath,
                     UseShellExecute        = false,
                     RedirectStandardOutput = true,
-                    RedirectStandardError  = true,
                     CreateNoWindow         = true,
                 }
             };
@@ -207,72 +195,83 @@ public partial class MainWindow : Window
             };
             _orchProcess.Start();
             _orchProcess.BeginOutputReadLine();
-
             AppendLog($"Orquestrador iniciado (PID {_orchProcess.Id}).");
-            ConnectIPC();
         }
         catch (Exception ex)
         {
-            AppendLog($"[ERRO] Não foi possível iniciar o orquestrador: {ex.Message}");
+            AppendLog($"[ERRO] {ex.Message}");
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // IPC — conecta ao named pipe do orquestrador
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Timer de reconexão ao pipe ───────────────────────────────────────────
 
-    private void ConnectIPC()
+    private async void OnConnectTick(object? sender, EventArgs e)
     {
+        if (_ipc?.IsConnected == true) return;   // já conectado
+
+        _ipc?.Dispose();
+        _ipcCts?.Cancel();
         _ipcCts = new CancellationTokenSource();
         _ipc    = new IPCClient();
 
-        Task.Run(async () =>
+        bool ok = await _ipc.ConnectAsync(_ipcCts.Token);
+        if (ok)
         {
-            bool connected = await _ipc.ConnectAsync(_ipcCts.Token);
-            Dispatcher.InvokeAsync(() =>
-            {
-                if (connected)
-                {
-                    SetHookStatus(connected: true, "Orquestrador conectado");
-                    _uiTimer.Start();
-                    AppendLog("IPC conectado ao orquestrador.");
-                }
-                else
-                {
-                    AppendLog("[AVISO] Não foi possível conectar ao orquestrador via pipe.");
-                }
-            });
-        });
+            SetHookStatus(false, "Orquestrador conectado");
+            _uiTimer.Start();
+            AppendLog("Conectado ao orquestrador via pipe.");
+            SetStatus("Conectado. Inicie o jogo e injete o hook.");
+        }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Timer de UI — lê dados do IPC e atualiza controles
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Timer de lista de processos ──────────────────────────────────────────
+
+    private void OnProcessTick(object? sender, EventArgs e)
+    {
+        // Atualiza a lista de processos visíveis (com janela)
+        _processes.Clear();
+        foreach (var p in Process.GetProcesses())
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(p.MainWindowTitle)) continue;
+                if (p.Id == Environment.ProcessId) continue;
+                _processes.Add(new ProcessViewModel
+                {
+                    PID  = (uint)p.Id,
+                    Name = p.ProcessName + ".exe",
+                });
+            }
+            catch { }
+        }
+    }
+
+    // ─── Timer de UI ──────────────────────────────────────────────────────────
 
     private async void OnUITick(object? sender, EventArgs e)
     {
-        if (_ipc == null || !_ipc.IsConnected) return;
+        if (_ipc == null || !_ipc.IsConnected)
+        {
+            _uiTimer.Stop();
+            SetHookStatus(false, "Aguardando orquestrador...");
+            return;
+        }
 
-        var snapshot = await _ipc.RequestSnapshotAsync();
-        if (snapshot == null) return;
+        var snap = await _ipc.RequestSnapshotAsync();
+        if (snap == null) return;
 
-        UpdateVRAMDisplay(snapshot);
-        UpdateStats(snapshot);
-        _chartVm.AddPoint(snapshot.VRAMPercent);
+        UpdateVRAMDisplay(snap);
+        UpdateStats(snap);
+        _chartVm.AddPoint(snap.VRAMPercent);
 
-        // Atualiza lista de texturas se a tab estiver visível
-        if (PanelTextures.Visibility == Visibility.Visible)
-            RefreshTextureList(snapshot.Textures);
+        bool hookOk = snap.HookConnected;
+        SetHookStatus(hookOk, hookOk ? "Hook conectado ao jogo" : "Hook não conectado");
 
-        // Indicador de hook
-        bool hookConnected = snapshot.HookConnected;
-        SetHookStatus(hookConnected,
-            hookConnected ? "Hook conectado" : "Hook desconectado");
+        if (PanelTextures.Visibility == Visibility.Visible && snap.Textures.Count > 0)
+            RefreshTextureList(snap.Textures);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Atualização dos controles de VRAM
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Atualização de controles ─────────────────────────────────────────────
 
     private void UpdateVRAMDisplay(OrchestratorSnapshot snap)
     {
@@ -287,28 +286,24 @@ public partial class MainWindow : Window
         RunPeak.Text     = $"{snap.PeakPercent:0.0}%";
         TxtBackend.Text  = $"Backend: {snap.Backend}";
 
-        // Cor da porcentagem e da barra conforme o nível
-        var (barColor, textColor) = pct switch
-        {
-            >= 95 => (Brushes.Red,    (Brush)FindResource("BrCrit")),
-            >= 80 => (Brushes.Orange, (Brush)FindResource("BrWarn")),
-            _     => (Brushes.Green,  (Brush)FindResource("BrOk")),
-        };
-        TxtVRAMPct.Foreground = textColor;
+        Brush pctBrush = pct >= 95 ? (Brush)FindResource("BrCrit")
+                       : pct >= 80 ? (Brush)FindResource("BrWarn")
+                       :             (Brush)FindResource("BrOk");
+        TxtVRAMPct.Foreground = pctBrush;
 
-        // Largura da barra proporcional ao container
-        VRAMBar.Dispatcher.InvokeAsync(() =>
+        Dispatcher.InvokeAsync(() =>
         {
             double maxW = ((Border)VRAMBar.Parent).ActualWidth;
+            if (maxW <= 0) return;
             VRAMBar.Width      = Math.Max(0, Math.Min(maxW, maxW * pct / 100.0));
-            VRAMBar.Background = barColor;
+            VRAMBar.Background = pctBrush;
         }, DispatcherPriority.Render);
     }
 
     private void UpdateStats(OrchestratorSnapshot snap)
     {
         TxtStatTextures.Text = $"{snap.CompressedTextures} / {snap.TotalTextures}";
-        TxtStatSaved.Text    = $"{snap.TotalSavedBytes / (1024.0*1024.0):0.1} MB";
+        TxtStatSaved.Text    = $"{snap.TotalSavedBytes / (1024.0 * 1024.0):0.1} MB";
         TxtStatActions.Text  = snap.ActionsFired.ToString();
     }
 
@@ -322,73 +317,74 @@ public partial class MainWindow : Window
             {
                 Name        = t.Name,
                 Resolution  = $"{t.Width}×{t.Height}",
-                SizeMB      = $"{t.SizeBytes / (1024.0*1024.0):0.1} MB",
-                Priority    = t.Priority switch
-                {
-                    1 => "Crítica",
-                    2 => "Alta",
-                    3 => "Média",
-                    4 => "Baixa",
-                    5 => "Descartável",
-                    _ => t.Priority.ToString()
-                },
+                SizeMB      = $"{t.SizeBytes / (1024.0 * 1024.0):0.1} MB",
+                Priority    = t.Priority switch { 1=>"Crítica",2=>"Alta",3=>"Média",4=>"Baixa",5=>"Descartável",_=>$"{t.Priority}" },
                 Compression = t.CompressionLevel == 0 ? "—" : t.CompressionName,
-                SavedMB     = t.SavedBytes > 0
-                              ? $"{t.SavedBytes/(1024.0*1024.0):0.1} MB"
-                              : "—",
+                SavedMB     = t.SavedBytes > 0 ? $"{t.SavedBytes/(1024.0*1024.0):0.1} MB" : "—",
             });
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Navegação entre tabs
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Tabs ─────────────────────────────────────────────────────────────────
 
-    private void ShowTab(FrameworkElement panel, Button activeBtn)
+    private void ShowTab(FrameworkElement panel, Button btn)
     {
         PanelConfig.Visibility   = Visibility.Collapsed;
         PanelTextures.Visibility = Visibility.Collapsed;
         PanelGraph.Visibility    = Visibility.Collapsed;
         PanelLog.Visibility      = Visibility.Collapsed;
         panel.Visibility         = Visibility.Visible;
-        _activePanel             = panel;
-
-        foreach (var btn in new[] { TabBtnConfig, TabBtnTextures,
-                                    TabBtnGraph, TabBtnLog })
-            btn.Style = (Style)FindResource("BtnSecondary");
-
-        activeBtn.Style = (Style)FindResource("BtnPrimary");
+        foreach (var b in new[] { TabBtnConfig, TabBtnTextures, TabBtnGraph, TabBtnLog })
+            b.Style = (Style)FindResource("BtnSecondary");
+        btn.Style = (Style)FindResource("BtnPrimary");
     }
 
-    private void TabConfig_Click   (object s, RoutedEventArgs e) => ShowTab(PanelConfig,   TabBtnConfig);
-    private void TabTextures_Click (object s, RoutedEventArgs e) => ShowTab(PanelTextures, TabBtnTextures);
-    private void TabGraph_Click    (object s, RoutedEventArgs e) => ShowTab(PanelGraph,    TabBtnGraph);
-    private void TabLog_Click      (object s, RoutedEventArgs e) => ShowTab(PanelLog,      TabBtnLog);
+    private void TabConfig_Click  (object s, RoutedEventArgs e) => ShowTab(PanelConfig,   TabBtnConfig);
+    private void TabTextures_Click(object s, RoutedEventArgs e) => ShowTab(PanelTextures, TabBtnTextures);
+    private void TabGraph_Click   (object s, RoutedEventArgs e) => ShowTab(PanelGraph,    TabBtnGraph);
+    private void TabLog_Click     (object s, RoutedEventArgs e) => ShowTab(PanelLog,      TabBtnLog);
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Controles de injeção
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Injeção ──────────────────────────────────────────────────────────────
 
     private void BtnInject_Click(object sender, RoutedEventArgs e)
     {
-        string proc    = TxtProcessName.Text.Trim();
-        string dll     = TxtDllPath.Text.Trim();
-        bool   watch   = ChkWatchMode.IsChecked == true;
-        string injPath = Path.Combine(
-            AppDomain.CurrentDomain.BaseDirectory, "vram_injector.exe");
+        string proc  = TxtProcessName.Text.Trim();
+        string dll   = TxtDllPath.Text.Trim();
+        bool   watch = ChkWatchMode.IsChecked == true;
 
-        if (!File.Exists(injPath))
-        {
-            AppendLog("[ERRO] vram_injector.exe não encontrado. Compile o projeto C++.");
-            return;
-        }
+        if (string.IsNullOrEmpty(proc)) { AppendLog("[ERRO] Informe o nome do processo."); return; }
+
+        string injPath = Path.GetFullPath(Path.Combine(BasePath, "vram_injector.exe"));
+        if (!File.Exists(injPath)) { AppendLog($"[ERRO] vram_injector.exe não encontrado em:\n  {injPath}"); return; }
 
         string args = watch
             ? $"--watch \"{proc}\" --dll \"{dll}\""
             : $"--inject \"{proc}\" --dll \"{dll}\"";
 
-        AppendLog($"Injetando em {proc} (modo: {(watch ? "watch" : "direto")})...");
+        AppendLog($"Injetando em {proc}...");
+        RunInjector(injPath, args);
+        SetStatus($"Injetor rodando — alvo: {proc}");
+    }
 
+    private void BtnEject_Click(object sender, RoutedEventArgs e)
+    {
+        string proc  = TxtProcessName.Text.Trim();
+        string dll   = TxtDllPath.Text.Trim();
+        string injPath = Path.GetFullPath(Path.Combine(BasePath, "vram_injector.exe"));
+        _watchProcess?.Kill();
+        RunInjector(injPath, $"--eject \"{proc}\" --dll \"{dll}\"");
+        AppendLog($"Ejetando de {proc}...");
+    }
+
+    private void BtnInjectSelected_Click(object sender, RoutedEventArgs e)
+    {
+        if (ListProcesses.SelectedItem is not ProcessViewModel pvm) return;
+        TxtProcessName.Text = pvm.Name;
+        BtnInject_Click(sender, e);
+    }
+
+    private void RunInjector(string injPath, string args)
+    {
         _watchProcess = new Process
         {
             StartInfo = new ProcessStartInfo
@@ -397,7 +393,6 @@ public partial class MainWindow : Window
                 Arguments              = args,
                 UseShellExecute        = false,
                 RedirectStandardOutput = true,
-                RedirectStandardError  = true,
                 CreateNoWindow         = true,
             }
         };
@@ -408,66 +403,21 @@ public partial class MainWindow : Window
         };
         _watchProcess.Start();
         _watchProcess.BeginOutputReadLine();
-        _watchRunning = true;
-
-        SetStatus($"Injetor rodando — alvo: {proc}");
-    }
-
-    private void BtnEject_Click(object sender, RoutedEventArgs e)
-    {
-        string proc    = TxtProcessName.Text.Trim();
-        string dll     = TxtDllPath.Text.Trim();
-        string injPath = Path.Combine(
-            AppDomain.CurrentDomain.BaseDirectory, "vram_injector.exe");
-
-        if (_watchProcess != null && !_watchProcess.HasExited)
-        {
-            _watchProcess.Kill();
-            _watchProcess = null;
-            _watchRunning = false;
-        }
-
-        RunInjectorCommand($"--eject \"{proc}\" --dll \"{dll}\"", injPath);
-        AppendLog($"Ejetando de {proc}...");
-        SetStatus("Ejeção solicitada.");
-    }
-
-    private void RunInjectorCommand(string args, string injPath)
-    {
-        var p = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName               = injPath,
-                Arguments              = args,
-                UseShellExecute        = false,
-                RedirectStandardOutput = true,
-                CreateNoWindow         = true,
-            }
-        };
-        p.OutputDataReceived += (_, ev) =>
-        {
-            if (ev.Data != null)
-                Dispatcher.InvokeAsync(() => AppendLog(ev.Data));
-        };
-        p.Start();
-        p.BeginOutputReadLine();
     }
 
     private void BtnBrowseDll_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog
-        {
-            Filter = "DLL files (*.dll)|*.dll|All files (*.*)|*.*",
-            Title  = "Selecionar vram_hook.dll",
-        };
-        if (dlg.ShowDialog() == true)
-            TxtDllPath.Text = dlg.FileName;
+        var dlg = new OpenFileDialog { Filter = "DLL files (*.dll)|*.dll", Title = "Selecionar vram_hook.dll" };
+        if (dlg.ShowDialog() == true) TxtDllPath.Text = dlg.FileName;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Configurações
-    // ─────────────────────────────────────────────────────────────────────────
+    private void ListProcesses_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ListProcesses.SelectedItem is ProcessViewModel pvm)
+            TxtProcessName.Text = pvm.Name;
+    }
+
+    // ─── Configurações ────────────────────────────────────────────────────────
 
     private void Slider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
@@ -482,13 +432,7 @@ public partial class MainWindow : Window
 
     private void BtnApplyConfig_Click(object sender, RoutedEventArgs e)
     {
-        // Envia configuração atualizada ao orquestrador via IPC
-        if (_ipc == null || !_ipc.IsConnected)
-        {
-            AppendLog("[AVISO] Orquestrador não conectado. Inicie-o primeiro.");
-            return;
-        }
-
+        if (_ipc == null || !_ipc.IsConnected) { AppendLog("[AVISO] Orquestrador não conectado."); return; }
         var cfg = new OrchestratorConfig
         {
             ThresholdWarning   = (float)SliderWarn.Value,
@@ -503,71 +447,44 @@ public partial class MainWindow : Window
             SkipCritical       = ChkSkipCritical.IsChecked == true,
             LogToFile          = ChkLogToFile.IsChecked == true,
         };
-
         _ = _ipc.SendConfigAsync(cfg);
         AppendLog("Configurações aplicadas.");
-        SetStatus("Configurações enviadas ao orquestrador.");
+        SetStatus("Configurações enviadas.");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Texturas
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Texturas ─────────────────────────────────────────────────────────────
 
-    private void BtnRestoreAll_Click(object sender, RoutedEventArgs e)
-    {
-        _ipc?.SendCommandAsync("restore_all");
-        AppendLog("Solicitando restauração de todas as texturas...");
-    }
+    private void BtnRestoreAll_Click    (object s, RoutedEventArgs e) { _ipc?.SendCommandAsync("restore_all"); AppendLog("Restaurando texturas..."); }
+    private void BtnRefreshTextures_Click(object s, RoutedEventArgs e) => AppendLog("Atualização manual solicitada.");
 
-    private void BtnRefreshTextures_Click(object sender, RoutedEventArgs e)
-    {
-        // A lista é atualizada automaticamente pelo timer; força um ciclo
-        AppendLog("Lista de texturas atualizada.");
-    }
+    // ─── Log ──────────────────────────────────────────────────────────────────
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Log
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private void BtnClearLog_Click(object sender, RoutedEventArgs e)
-    {
-        TxtLog.Clear();
-    }
+    private void BtnClearLog_Click(object s, RoutedEventArgs e) => TxtLog.Clear();
 
     private void AppendLog(string msg)
     {
-        string line = $"[{DateTime.Now:HH:mm:ss}] {msg}\n";
-        TxtLog.AppendText(line);
+        TxtLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}\n");
         TxtLog.ScrollToEnd();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Helpers de status
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── Helpers ──────────────────────────────────────────────────────────────
 
     private void SetStatus(string msg) => TxtStatusBar.Text = msg;
 
     private void SetHookStatus(bool connected, string msg)
     {
-        EllipseHookStatus.Fill = connected
-            ? (Brush)FindResource("BrOk")
-            : (Brush)FindResource("BrTextSec");
+        EllipseHookStatus.Fill   = connected ? (Brush)FindResource("BrOk")
+                                             : (Brush)FindResource("BrTextSec");
         TxtHookStatus.Text       = msg;
-        TxtHookStatus.Foreground = connected
-            ? (Brush)FindResource("BrOk")
-            : (Brush)FindResource("BrTextSec");
+        TxtHookStatus.Foreground = connected ? (Brush)FindResource("BrOk")
+                                             : (Brush)FindResource("BrTextSec");
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// IPCClient — comunica com o orquestrador C++ via Named Pipe
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── IPC Client ───────────────────────────────────────────────────────────────
 
-// Estruturas de dados trocadas via pipe (espelham as do C++)
-public record TextureInfo(
-    string Name, uint Width, uint Height,
-    long SizeBytes, long SavedBytes,
-    int Priority, int CompressionLevel, string CompressionName);
+public record TextureInfo(string Name, uint Width, uint Height,
+    long SizeBytes, long SavedBytes, int Priority, int CompressionLevel, string CompressionName);
 
 public record OrchestratorSnapshot(
     double VRAMPercent, double PeakPercent,
@@ -591,9 +508,8 @@ public class OrchestratorConfig
     public bool  LogToFile          { get; set; } = true;
 }
 
-public class IPCClient
+public class IPCClient : IDisposable
 {
-    // Nome do pipe de status: o orquestrador envia snapshots em JSON simples
     private const string PIPE_STATUS = "vram_opt_status";
     private const string PIPE_UI_CMD = "vram_opt_ui_cmd";
 
@@ -601,22 +517,19 @@ public class IPCClient
     private NamedPipeClientStream? _pipeCmd;
     private StreamReader?          _reader;
 
-    public bool IsConnected =>
-        _pipeStatus?.IsConnected == true;
+    public bool IsConnected => _pipeStatus?.IsConnected == true;
 
     public async Task<bool> ConnectAsync(CancellationToken ct)
     {
         try
         {
-            _pipeStatus = new NamedPipeClientStream(
-                ".", PIPE_STATUS, PipeDirection.In,
-                PipeOptions.Asynchronous);
-            await _pipeStatus.ConnectAsync(5000, ct);
+            _pipeStatus = new NamedPipeClientStream(".", PIPE_STATUS,
+                PipeDirection.In, PipeOptions.Asynchronous);
+            await _pipeStatus.ConnectAsync(1000, ct);
 
-            _pipeCmd = new NamedPipeClientStream(
-                ".", PIPE_UI_CMD, PipeDirection.Out,
-                PipeOptions.Asynchronous);
-            await _pipeCmd.ConnectAsync(2000, ct);
+            _pipeCmd = new NamedPipeClientStream(".", PIPE_UI_CMD,
+                PipeDirection.Out, PipeOptions.Asynchronous);
+            await _pipeCmd.ConnectAsync(1000, ct);
 
             _reader = new StreamReader(_pipeStatus, Encoding.UTF8);
             return true;
@@ -629,10 +542,8 @@ public class IPCClient
         if (_reader == null || !IsConnected) return null;
         try
         {
-            // O orquestrador envia uma linha JSON por tick
-            string? line = await _reader.ReadLineAsync();
-            if (line == null) return null;
-            return ParseSnapshot(line);
+            var line = await _reader.ReadLineAsync();
+            return line == null ? null : ParseSnapshot(line);
         }
         catch { return null; }
     }
@@ -640,7 +551,6 @@ public class IPCClient
     public async Task SendConfigAsync(OrchestratorConfig cfg)
     {
         if (_pipeCmd == null || !_pipeCmd.IsConnected) return;
-        // Serialização simples key=value por linha
         var sb = new StringBuilder();
         sb.AppendLine($"CONFIG warn={cfg.ThresholdWarning}");
         sb.AppendLine($"CONFIG low={cfg.ThresholdLow}");
@@ -649,61 +559,52 @@ public class IPCClient
         sb.AppendLine($"CONFIG max_tex={cfg.MaxCompressPerTick}");
         sb.AppendLine($"CONFIG interval={cfg.MonitorIntervalMs}");
         sb.AppendLine($"CONFIG format={cfg.FormatPreference}");
-        sb.AppendLine($"CONFIG half_res={(cfg.AllowHalfRes ? 1 : 0)}");
-        sb.AppendLine($"CONFIG quarter_res={(cfg.AllowQuarterRes ? 1 : 0)}");
-        sb.AppendLine($"CONFIG skip_critical={(cfg.SkipCritical ? 1 : 0)}");
+        sb.AppendLine($"CONFIG half_res={(cfg.AllowHalfRes?1:0)}");
+        sb.AppendLine($"CONFIG quarter_res={(cfg.AllowQuarterRes?1:0)}");
+        sb.AppendLine($"CONFIG skip_critical={(cfg.SkipCritical?1:0)}");
         var bytes = Encoding.UTF8.GetBytes(sb.ToString());
-        await _pipeCmd.WriteAsync(bytes);
-        await _pipeCmd.FlushAsync();
+        try { await _pipeCmd.WriteAsync(bytes); await _pipeCmd.FlushAsync(); } catch { }
     }
 
     public async void SendCommandAsync(string cmd)
     {
         if (_pipeCmd == null || !_pipeCmd.IsConnected) return;
         var bytes = Encoding.UTF8.GetBytes(cmd + "\n");
-        await _pipeCmd.WriteAsync(bytes);
-        await _pipeCmd.FlushAsync();
+        try { await _pipeCmd.WriteAsync(bytes); await _pipeCmd.FlushAsync(); } catch { }
     }
 
-    // Parse simples de JSON manual (evita dep em System.Text.Json para manter leve)
-    // Formato enviado pelo C++:
-    // {"pct":42.5,"peak":75.0,"used":1073741824,"total":2147483648,...}
     private static OrchestratorSnapshot? ParseSnapshot(string json)
     {
         try
         {
-            double Get(string key)
-            {
+            double Get(string key) {
                 int i = json.IndexOf($"\"{key}\":", StringComparison.Ordinal);
                 if (i < 0) return 0;
-                int start = json.IndexOf(':', i) + 1;
-                int end   = json.IndexOfAny(new[] {',', '}'}, start);
-                return double.Parse(json[start..end].Trim());
+                int s = json.IndexOf(':', i) + 1;
+                int end = json.IndexOfAny(new[]{',','}'}, s);
+                return double.Parse(json[s..end].Trim(), System.Globalization.CultureInfo.InvariantCulture);
             }
-            string GetStr(string key)
-            {
+            string GetStr(string key) {
                 int i = json.IndexOf($"\"{key}\":\"", StringComparison.Ordinal);
                 if (i < 0) return "";
-                int start = json.IndexOf('"', json.IndexOf(':', i) + 1) + 1;
-                int end   = json.IndexOf('"', start);
-                return json[start..end];
+                int s = json.IndexOf('"', json.IndexOf(':', i)+1)+1;
+                return json[s..json.IndexOf('"', s)];
             }
-
             return new OrchestratorSnapshot(
-                VRAMPercent:       Get("pct"),
-                PeakPercent:       Get("peak"),
-                UsedBytes:         (long)Get("used"),
-                TotalBytes:        (long)Get("total"),
-                FreeBytes:         (long)Get("free"),
-                Backend:           GetStr("backend"),
-                HookConnected:     (int)Get("hook") == 1,
-                TotalSavedBytes:   (long)Get("saved"),
-                TotalTextures:     (int)Get("total_tex"),
-                CompressedTextures:(int)Get("comp_tex"),
-                ActionsFired:      (int)Get("actions"),
-                Textures:          new List<TextureInfo>() // detalhes via request separado
-            );
+                Get("pct"), Get("peak"),
+                (long)Get("used"), (long)Get("total"), (long)Get("free"),
+                GetStr("backend"), (int)Get("hook")==1,
+                (long)Get("saved"), (int)Get("total_tex"),
+                (int)Get("comp_tex"), (int)Get("actions"),
+                new List<TextureInfo>());
         }
         catch { return null; }
+    }
+
+    public void Dispose()
+    {
+        _reader?.Dispose();
+        _pipeStatus?.Dispose();
+        _pipeCmd?.Dispose();
     }
 }
